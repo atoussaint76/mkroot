@@ -3,7 +3,7 @@
 ### Parse command line arguments. Clear and set up environment variables.
 
 # Show usage for any unknown argument, ala "./mkroot.sh --help"
-if [ "${1:0:1}" == '-' ] && [ "$1" != '-n' ] && [ "$1" != '-d' ]
+if [ "${1:0:1}" == '-' ] && [ "$1" != '-n' ] && [ "$1" != '-d' ] && [ "$1" != "-l" ]
 then
   echo "usage: $0 [-n] [VAR=VALUE...] [MODULE...]"
   echo
@@ -11,18 +11,27 @@ then
   echo
   echo "-n	Don't rebuild "'$ROOT, just build module(s) over it'
   echo "-d	Don't build, just download/verify source packages."
+  echo "-l	Log every command run during build in cmdlog.txt"
 
   exit 1
 fi
 
 # Clear environment variables by restarting script w/bare minimum passed through
+# => preserve proxy variables for those behind a proxy server.
 [ -z "$NOCLEAR" ] &&
   exec env -i NOCLEAR=1 HOME="$HOME" PATH="$PATH" \
+    $(env | grep -i _proxy=) \
     CROSS_COMPILE="$CROSS_COMPILE" CROSS_SHORT="$CROSS_SHORT" "$0" "$@"
 
-# Parse arguments: assign NAME=VALUE to env vars and collect rest in $MODULES
-[ "$1" == "-n" ] && N=1 && shift
-[ "$1" == "-d" ] && D=1 && shift
+# Loop collecting initial -x arguments. (Simple, can't collate ala -nl .)
+while true
+do
+  [ "$1" == "-n" ] && N=1 && shift ||
+  [ "$1" == "-d" ] && D=1 && shift ||
+  [ "$1" == "-l" ] && WRAPDIR=wrap && shift || break
+done
+
+# Parse remaining args: assign NAME=VALUE to env vars, collect rest in $MODULES
 while [ $# -ne 0 ]
 do
   X="${1/=*/}"
@@ -30,12 +39,6 @@ do
   [ "${1/=/}" != "$1" ] && eval "export $X=\"\$Y\"" || MODULES="$MODULES $1"
   shift
 done
-
-# Work out absolute paths to working dirctories (can override on cmdline)
-TOP="$PWD"
-[ -z "$BUILD" ] && BUILD="$TOP/build"
-[ -z "$DOWNLOAD" ] && DOWNLOAD="$TOP/download"
-[ -z "$AIRLOCK" ] && AIRLOCK="$TOP/airlock"
 
 # If we're cross compiling, set appropriate environment variables.
 if [ -z "$CROSS_COMPILE" ]
@@ -57,6 +60,12 @@ else
     exit 1
   fi
 fi
+
+# Work out absolute paths to working dirctories (can override on cmdline)
+TOP="$PWD"
+[ -z "$BUILD" ] && BUILD="$TOP/build"
+[ -z "$DOWNLOAD" ] && DOWNLOAD="$TOP/download"
+[ -z "$AIRLOCK" ] && AIRLOCK="$TOP/airlock"
 [ -z "$OUTPUT" ] && OUTPUT="$TOP/output/${CROSS_SHORT:-host}"
 [ -z "$ROOT" ] && ROOT="$OUTPUT/${CROSS_BASE}root"
 
@@ -123,8 +132,8 @@ cleanup()
 
 ### Download source
 
-download 9b5b2be83e29c05e63a0751c84f23caad0bf5beb \
-  http://landley.net/toybox/downloads/toybox-0.7.8.tar.gz
+download 48c50092cbf936e4443cddb24b7458e6e8235492 \
+  http://landley.net/toybox/downloads/toybox-0.8.0.tar.gz
 
 download 157d14d24748b4505b1a418535688706a2b81680 \
   http://www.busybox.net/downloads/busybox-1.24.1.tar.bz2
@@ -134,9 +143,22 @@ download 157d14d24748b4505b1a418535688706a2b81680 \
 # When cross compiling, provide known $PATH contents for build (mostly toybox),
 # and filter out host $PATH stuff that confuses build
 
+# We can also wrap the command $PATH and log every command line called.
+
 if [ ! -z "$CROSS_COMPILE" ]
 then
-  if [ ! -e "$AIRLOCK/toybox" ]
+  # This is here so it happens even if airlock already exists
+  if [ ! -z "$WRAPDIR" ]
+  then
+    WRAPDIR="$(readlink -f "$WRAPDIR")"
+    [ ! -z "$WRAPLOG" ] && WRAPLOG="$(readlink -f "$WRAPLOG")" ||
+      WRAPLOG="$OUTPUT/cmdlog.txt"
+    export WRAPLOG
+    mkdir -p "$(dirname "$WRAPLOG")"
+  fi
+
+  if [ ! -e "$AIRLOCK/toybox" ] || [ ! -z "$WRAPDIR" ] &&
+     [ ! -e "$WRAPDIR/logwrapper" ]
   then
     echo === Create airlock dir
 
@@ -144,9 +166,17 @@ then
     CROSS_COMPILE= make defconfig &&
     CROSS_COMPILE= make &&
     CROSS_COMPILE= PREFIX="$AIRLOCK" make install_airlock || exit 1
+    if [ ! -z "$WRAPDIR" ]
+    then
+      echo === Create command logging wrapper dir
+      PATH="$CROSS_PATH:$AIRLOCK" WRAPDIR="$WRAPDIR" WRAPLOG="$WRAPLOG" \
+        CROSS_COMPILE= scripts/record-commands "" || exit 1
+    fi
     cleanup
   fi
+
   export PATH="$CROSS_PATH:$AIRLOCK"
+  [ ! -z "$WRAPDIR" ] && PATH="$WRAPDIR:$PATH"
 fi
 
 # -n skips rebuilding base system, adds to existing $ROOT
@@ -157,6 +187,8 @@ then
     echo "-n needs an existing $ROOT and build files"
     exit 1
   fi
+
+# -d skips everything but downloading packages
 elif [ -z "$D" ]
 then
 
@@ -186,6 +218,9 @@ fi
 
 if [ $$ -eq 1 ]
 then
+  # Don't allow deferred initialization to crap messages over the shell prompt
+  echo 3 3 > /proc/sys/kernel/printk
+
   # Setup networking for QEMU (needs /proc)
   ifconfig eth0 10.0.2.15
   route add default gw 10.0.2.2
